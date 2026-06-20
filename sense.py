@@ -112,6 +112,22 @@ def audio_loop():
                 print(f"[Audio] Logged to {module}/{feature}")
                 break
 
+# --- Emotion Detector (Social module) ---
+# Reads OTHER people's faces during conversations, not the owner's.
+# A persisted personal-bias baseline doesn't generalize across different
+# people's faces, and persisting one tied to whoever's in frame would be
+# exactly the kind of per-person behavioral profiling the project's own
+# Perception Calibration design explicitly rules out. So: no file on disk,
+# no identity. Each "session" (a face appearing after a gap of no face)
+# gets a short silent calibration window, held in memory only, used as a
+# relative offset for that session, then thrown away when the face leaves.
+
+FACE_GAP_SECONDS = 20       # no face for this long = next face starts a new session
+SESSION_CALIBRATION_READINGS = 8  # silent readings collected before logging starts
+CORRECTED_FLOOR = 15        # corrected score must clear this to count as a real signal
+WINDOW_SIZE = 8
+MIN_AGREEMENT = 6
+
 def vision_loop():
     print("[Vision] Opening webcam...")
     cap = cv2.VideoCapture(0)
@@ -124,7 +140,13 @@ def vision_loop():
         time.sleep(0.03)
     print("[Vision] Ready.")
 
-    WINDOW_SIZE = 5
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+    last_face_seen = 0
+    session_active = False
+    session_calibration_readings = []
+    session_baseline = {}
+
     recent = deque(maxlen=WINDOW_SIZE)
     last_logged = None
 
@@ -132,21 +154,79 @@ def vision_loop():
         ret, frame = cap.read()
         if not ret:
             continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+        face_present = len(faces) > 0
+        now = time.time()
+
+        if not face_present:
+            if session_active and (now - last_face_seen) > FACE_GAP_SECONDS:
+                # Session ended — discard everything, no trace kept.
+                print("[Vision] Face gone >20s — session ended, baseline discarded.")
+                session_active = False
+                session_calibration_readings = []
+                session_baseline = {}
+                recent.clear()
+                last_logged = None
+            time.sleep(1)
+            continue
+
+        last_face_seen = now
+
         try:
             result = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False)
             if isinstance(result, list):
                 result = result[0]
-            dominant = result['dominant_emotion']
-            recent.append(dominant)
-
-            if len(recent) == WINDOW_SIZE:
-                settled = Counter(recent).most_common(1)[0][0]
-                if settled != last_logged:
-                    log_event("self", "emotion", settled)
-                    print(f"[Vision] Logged emotion change: {settled}")
-                    last_logged = settled
+            raw_scores = result['emotion']  # dict, 0-100 per emotion
         except Exception as e:
             print(f"[Vision] Error: {e}")
+            time.sleep(1)
+            continue
+
+        if not session_active:
+            # New session — start silent calibration on whoever this face is.
+            session_active = True
+            session_calibration_readings = []
+            print("[Vision] New face detected — starting silent calibration...")
+
+        if len(session_calibration_readings) < SESSION_CALIBRATION_READINGS:
+            session_calibration_readings.append(raw_scores)
+            print(f"[Vision] Calibrating ({len(session_calibration_readings)}/{SESSION_CALIBRATION_READINGS})...")
+            if len(session_calibration_readings) == SESSION_CALIBRATION_READINGS:
+                emotions = session_calibration_readings[0].keys()
+                session_baseline = {
+                    emotion: float(sum(r[emotion] for r in session_calibration_readings) / len(session_calibration_readings))
+                    for emotion in emotions
+                }
+                print(f"[Vision] Session baseline set: {session_baseline}")
+            time.sleep(1)
+            continue
+
+        # Calibrated — apply relative correction and log on settled change.
+        corrected = {
+            emotion: raw_scores[emotion] - session_baseline.get(emotion, 0)
+            for emotion in raw_scores
+        }
+        dominant = max(corrected, key=corrected.get)
+        corrected_score = corrected[dominant]
+
+        print(f"[Vision] raw={result['dominant_emotion']}({raw_scores[result['dominant_emotion']]:.1f}) "
+              f"corrected_dominant={dominant}({corrected_score:.1f})")
+
+        if corrected_score < CORRECTED_FLOOR:
+            time.sleep(2)
+            continue
+
+        recent.append(dominant)
+
+        if len(recent) == WINDOW_SIZE:
+            settled, count = Counter(recent).most_common(1)[0]
+            if count >= MIN_AGREEMENT and settled != last_logged:
+                log_event("social", "emotion_detector", settled)
+                print(f"[Vision] Logged emotion change: {settled} ({count}/{WINDOW_SIZE} agreement)")
+                last_logged = settled
+
         time.sleep(2)
 
 if __name__ == "__main__":

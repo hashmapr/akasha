@@ -47,7 +47,7 @@ FEATURE_PROFILE = {
     ("body", "supplement_log"):  {"importance": "low",    "interruptible": False},
     ("body", "energy"):          {"importance": "medium", "interruptible": True},
     ("body", "tension"):         {"importance": "high",   "interruptible": True},
-    ("self", "emotion"):         {"importance": "medium", "interruptible": True},
+    ("social", "emotion_detector"): {"importance": "medium", "interruptible": True},
 }
 
 DEFAULT_PROFILE = {"importance": "low", "interruptible": False}
